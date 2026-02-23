@@ -1,0 +1,11 @@
+{
+  "manifest_version": 1,
+  "name": "QQWife 群老婆插件",
+  "version": "1.0.0",
+  "description": "ZeroBot qqwife 迁移版，提供群老婆、自由恋爱、牛头人、做媒、离婚和好感度系统",
+  "author": {
+    "name": "MaiBot Contributors"
+  },
+  "license": "MIT",
+  "id": "MaiBot.qqwife_plugin"
+}
