@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import os
 from contextlib import asynccontextmanager
@@ -60,34 +61,33 @@ class QQWifeDB:
     def __init__(self) -> None:
         self.conn: Optional[aiosqlite.Connection] = None
         self._tx_depth = 0
-        self._has_maibot = False
+        self._conn_init_lock = asyncio.Lock()
 
     async def _ensure_conn(self) -> None:
         if self.conn is not None:
             return
-        os.makedirs(QQWIFE_DIR, exist_ok=True)
-        self.conn = await aiosqlite.connect(QQWIFE_DB_PATH)
-        self.conn.row_factory = aiosqlite.Row
-        await self.conn.execute("PRAGMA journal_mode = WAL")
-        await self.conn.execute("PRAGMA synchronous = NORMAL")
-        await self.conn.execute("PRAGMA busy_timeout = 2000")
-        await self.conn.execute("PRAGMA temp_store = MEMORY")
-        await self.conn.execute("PRAGMA foreign_keys = ON")
+        async with self._conn_init_lock:
+            if self.conn is not None:
+                return
 
-        wallet_dir = os.path.dirname(WALLET_DB_PATH)
-        os.makedirs(wallet_dir, exist_ok=True)
-        await self.conn.execute("ATTACH DATABASE ? AS wallet", (WALLET_DB_PATH,))
-        if os.path.exists(MAIBOT_DB_PATH):
-            try:
-                await self.conn.execute("ATTACH DATABASE ? AS maibot", (MAIBOT_DB_PATH,))
-                self._has_maibot = True
-            except Exception:
-                self._has_maibot = False
-        await self._init_db()
+            os.makedirs(QQWIFE_DIR, exist_ok=True)
+            conn = await aiosqlite.connect(QQWIFE_DB_PATH)
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode = WAL")
+            await conn.execute("PRAGMA synchronous = NORMAL")
+            await conn.execute("PRAGMA busy_timeout = 2000")
+            await conn.execute("PRAGMA temp_store = MEMORY")
+            await conn.execute("PRAGMA foreign_keys = ON")
 
-    async def _init_db(self) -> None:
-        assert self.conn is not None
-        await self.conn.execute(
+            wallet_dir = os.path.dirname(WALLET_DB_PATH)
+            os.makedirs(wallet_dir, exist_ok=True)
+            await conn.execute("ATTACH DATABASE ? AS wallet", (WALLET_DB_PATH,))
+
+            await self._init_db(conn)
+            self.conn = conn
+
+    async def _init_db(self, conn: aiosqlite.Connection) -> None:
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS group_settings (
                 group_id TEXT PRIMARY KEY,
@@ -98,7 +98,7 @@ class QQWifeDB:
             )
             """
         )
-        await self.conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS marriages (
                 group_id TEXT NOT NULL,
@@ -112,13 +112,13 @@ class QQWifeDB:
             )
             """
         )
-        await self.conn.execute(
+        await conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_marriages_group_target ON marriages(group_id, target_id)"
         )
-        await self.conn.execute(
+        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_marriages_group_date ON marriages(group_id, married_date, married_at)"
         )
-        await self.conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS cd_records (
                 group_id TEXT NOT NULL,
@@ -129,7 +129,7 @@ class QQWifeDB:
             )
             """
         )
-        await self.conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS favorability (
                 user_a TEXT NOT NULL,
@@ -139,9 +139,9 @@ class QQWifeDB:
             )
             """
         )
-        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_favor_user_a ON favorability(user_a)")
-        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_favor_user_b ON favorability(user_b)")
-        await self.conn.execute(
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_favor_user_a ON favorability(user_a)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_favor_user_b ON favorability(user_b)")
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS active_users (
                 group_id TEXT NOT NULL,
@@ -152,10 +152,10 @@ class QQWifeDB:
             )
             """
         )
-        await self.conn.execute(
+        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_active_group_time ON active_users(group_id, last_seen DESC)"
         )
-        await self.conn.execute(
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS wallet.wallet_data (
                 uid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,7 +164,7 @@ class QQWifeDB:
             )
             """
         )
-        await self.conn.commit()
+        await conn.commit()
 
     def _in_transaction(self) -> bool:
         return self._tx_depth > 0
@@ -372,33 +372,36 @@ class QQWifeDB:
         limit: int = 30,
         exclude_user_ids: Optional[Sequence[str]] = None,
     ) -> List[ActiveUser]:
-        await self._ensure_conn()
-        if not self._has_maibot:
+        if not os.path.exists(MAIBOT_DB_PATH):
             return []
-        assert self.conn is not None
         excludes = {str(i) for i in (exclude_user_ids or [])}
         users: List[ActiveUser] = []
         try:
-            async with self.conn.execute(
-                """
-                SELECT
-                    user_id,
-                    COALESCE(NULLIF(user_cardname, ''), NULLIF(user_nickname, ''), user_id) AS nickname,
-                    MAX(time) AS last_seen
-                FROM maibot.messages
-                WHERE
-                    chat_info_group_id = ?
-                    AND chat_info_platform = ?
-                    AND message_id != 'notice'
-                    AND user_id IS NOT NULL
-                    AND user_id != ''
-                GROUP BY user_id
-                ORDER BY last_seen DESC
-                LIMIT ?
-                """,
-                (group_id, platform, max(limit * 3, 30)),
-            ) as cursor:
-                rows = await cursor.fetchall()
+            # Use an isolated connection so qqwife write transactions never lock MaiBot message storage.
+            async with aiosqlite.connect(MAIBOT_DB_PATH, timeout=1.0) as maibot_conn:
+                maibot_conn.row_factory = aiosqlite.Row
+                await maibot_conn.execute("PRAGMA busy_timeout = 1000")
+                await maibot_conn.execute("PRAGMA query_only = ON")
+                async with maibot_conn.execute(
+                    """
+                    SELECT
+                        user_id,
+                        COALESCE(NULLIF(user_cardname, ''), NULLIF(user_nickname, ''), user_id) AS nickname,
+                        MAX(time) AS last_seen
+                    FROM messages
+                    WHERE
+                        chat_info_group_id = ?
+                        AND chat_info_platform = ?
+                        AND message_id != 'notice'
+                        AND user_id IS NOT NULL
+                        AND user_id != ''
+                    GROUP BY user_id
+                    ORDER BY last_seen DESC
+                    LIMIT ?
+                    """,
+                    (group_id, platform, max(limit * 3, 30)),
+                ) as cursor:
+                    rows = await cursor.fetchall()
         except Exception:
             return []
 
