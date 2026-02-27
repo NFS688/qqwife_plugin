@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import datetime as dt
 import os
 from contextlib import asynccontextmanager
@@ -60,8 +61,12 @@ class ActiveUser:
 class QQWifeDB:
     def __init__(self) -> None:
         self.conn: Optional[aiosqlite.Connection] = None
-        self._tx_depth = 0
         self._conn_init_lock = asyncio.Lock()
+        self._tx_lock = asyncio.Lock()
+        self._local_tx_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+            "qqwife_tx_depth",
+            default=0,
+        )
 
     async def _ensure_conn(self) -> None:
         if self.conn is not None:
@@ -71,7 +76,7 @@ class QQWifeDB:
                 return
 
             os.makedirs(QQWIFE_DIR, exist_ok=True)
-            conn = await aiosqlite.connect(QQWIFE_DB_PATH)
+            conn = await aiosqlite.connect(QQWIFE_DB_PATH, isolation_level=None)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA journal_mode = WAL")
             await conn.execute("PRAGMA synchronous = NORMAL")
@@ -167,32 +172,45 @@ class QQWifeDB:
         await conn.commit()
 
     def _in_transaction(self) -> bool:
-        return self._tx_depth > 0
+        return self._local_tx_depth.get() > 0
 
     async def _commit_if_needed(self) -> None:
         assert self.conn is not None
-        if not self._in_transaction():
-            await self.conn.commit()
+        if self._in_transaction():
+            return
+        # If another coroutine owns the transaction lock, never commit from here.
+        # Commit/rollback is then controlled by that lock holder.
+        if self._tx_lock.locked():
+            return
+        await self.conn.commit()
 
     @asynccontextmanager
     async def transaction(self):
         await self._ensure_conn()
         assert self.conn is not None
-        root = self._tx_depth == 0
+        current_depth = self._local_tx_depth.get()
+        root = current_depth == 0
         if root:
-            await self.conn.execute("BEGIN IMMEDIATE")
-        self._tx_depth += 1
+            await self._tx_lock.acquire()
+            try:
+                await self.conn.execute("BEGIN IMMEDIATE")
+            except Exception:
+                self._tx_lock.release()
+                raise
+        token = self._local_tx_depth.set(current_depth + 1)
         try:
             yield
         except Exception:
-            self._tx_depth -= 1
             if root:
                 await self.conn.rollback()
             raise
         else:
-            self._tx_depth -= 1
             if root:
                 await self.conn.commit()
+        finally:
+            self._local_tx_depth.reset(token)
+            if root and self._tx_lock.locked():
+                self._tx_lock.release()
 
     async def get_group_settings(self, group_id: str, default_cd_hours: float = 12.0) -> GroupSettings:
         await self._ensure_conn()
@@ -224,25 +242,25 @@ class QQWifeDB:
     async def save_group_settings(self, settings: GroupSettings) -> None:
         await self._ensure_conn()
         assert self.conn is not None
-        await self.conn.execute(
-            """
-            INSERT INTO group_settings (group_id, last_reset_date, can_match, can_ntr, cd_hours)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(group_id) DO UPDATE SET
-                last_reset_date = excluded.last_reset_date,
-                can_match = excluded.can_match,
-                can_ntr = excluded.can_ntr,
-                cd_hours = excluded.cd_hours
-            """,
-            (
-                settings.group_id,
-                settings.last_reset_date,
-                int(settings.can_match),
-                int(settings.can_ntr),
-                float(settings.cd_hours),
-            ),
-        )
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute(
+                """
+                INSERT INTO group_settings (group_id, last_reset_date, can_match, can_ntr, cd_hours)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    last_reset_date = excluded.last_reset_date,
+                    can_match = excluded.can_match,
+                    can_ntr = excluded.can_ntr,
+                    cd_hours = excluded.cd_hours
+                """,
+                (
+                    settings.group_id,
+                    settings.last_reset_date,
+                    int(settings.can_match),
+                    int(settings.can_ntr),
+                    float(settings.cd_hours),
+                ),
+            )
 
     async def ensure_daily_reset(self, group_id: str, default_cd_hours: float = 12.0) -> GroupSettings:
         async with self.transaction():
@@ -265,20 +283,20 @@ class QQWifeDB:
         await self._ensure_conn()
         assert self.conn is not None
         now = float(seen_ts if seen_ts is not None else dt.datetime.now().timestamp())
-        await self.conn.execute(
-            """
-            INSERT INTO active_users (group_id, user_id, nickname, last_seen)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(group_id, user_id) DO UPDATE SET
-                nickname = CASE WHEN excluded.nickname != '' THEN excluded.nickname ELSE active_users.nickname END,
-                last_seen = CASE
-                    WHEN excluded.last_seen > active_users.last_seen THEN excluded.last_seen
-                    ELSE active_users.last_seen
-                END
-            """,
-            (group_id, user_id, nickname.strip(), now),
-        )
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute(
+                """
+                INSERT INTO active_users (group_id, user_id, nickname, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(group_id, user_id) DO UPDATE SET
+                    nickname = CASE WHEN excluded.nickname != '' THEN excluded.nickname ELSE active_users.nickname END,
+                    last_seen = CASE
+                        WHEN excluded.last_seen > active_users.last_seen THEN excluded.last_seen
+                        ELSE active_users.last_seen
+                    END
+                """,
+                (group_id, user_id, nickname.strip(), now),
+            )
 
     async def get_user_display_name(self, group_id: str, user_id: str, fallback: Optional[str] = None) -> str:
         await self._ensure_conn()
@@ -378,7 +396,7 @@ class QQWifeDB:
         users: List[ActiveUser] = []
         try:
             # Use an isolated connection so qqwife write transactions never lock MaiBot message storage.
-            async with aiosqlite.connect(MAIBOT_DB_PATH, timeout=1.0) as maibot_conn:
+            async with aiosqlite.connect(MAIBOT_DB_PATH, timeout=1.0, isolation_level=None) as maibot_conn:
                 maibot_conn.row_factory = aiosqlite.Row
                 await maibot_conn.execute("PRAGMA busy_timeout = 1000")
                 await maibot_conn.execute("PRAGMA query_only = ON")
@@ -459,49 +477,53 @@ class QQWifeDB:
         assert self.conn is not None
         now = dt.datetime.now()
         try:
-            await self.conn.execute(
-                """
-                INSERT INTO marriages (
-                    group_id, user_id, target_id, username, target_name, married_date, married_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    group_id,
-                    user_id,
-                    target_id,
-                    username,
-                    target_name,
-                    now.date().isoformat(),
-                    now.strftime("%H:%M:%S"),
-                ),
-            )
-            await self._commit_if_needed()
+            async with self.transaction():
+                await self.conn.execute(
+                    """
+                    INSERT INTO marriages (
+                        group_id, user_id, target_id, username, target_name, married_date, married_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        group_id,
+                        user_id,
+                        target_id,
+                        username,
+                        target_name,
+                        now.date().isoformat(),
+                        now.strftime("%H:%M:%S"),
+                    ),
+                )
             return True
-        except Exception:
-            return False
+        except aiosqlite.IntegrityError as exc:
+            # Only treat unique constraint conflicts as "already taken/race lost".
+            # Other integrity errors should propagate as real failures.
+            if "UNIQUE constraint failed: marriages." in str(exc):
+                return False
+            raise
 
     async def delete_marriage_by_user(self, group_id: str, user_id: str) -> bool:
         await self._ensure_conn()
         assert self.conn is not None
-        await self.conn.execute(
-            "DELETE FROM marriages WHERE group_id = ? AND user_id = ?",
-            (group_id, user_id),
-        )
-        async with self.conn.execute("SELECT changes() AS cnt") as cursor:
-            row = await cursor.fetchone()
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute(
+                "DELETE FROM marriages WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            async with self.conn.execute("SELECT changes() AS cnt") as cursor:
+                row = await cursor.fetchone()
         return bool(row and int(row["cnt"]) > 0)
 
     async def delete_marriage_by_target(self, group_id: str, target_id: str) -> bool:
         await self._ensure_conn()
         assert self.conn is not None
-        await self.conn.execute(
-            "DELETE FROM marriages WHERE group_id = ? AND target_id = ?",
-            (group_id, target_id),
-        )
-        async with self.conn.execute("SELECT changes() AS cnt") as cursor:
-            row = await cursor.fetchone()
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute(
+                "DELETE FROM marriages WHERE group_id = ? AND target_id = ?",
+                (group_id, target_id),
+            )
+            async with self.conn.execute("SELECT changes() AS cnt") as cursor:
+                row = await cursor.fetchone()
         return bool(row and int(row["cnt"]) > 0)
 
     async def list_group_marriages(self, group_id: str, include_single: bool = False) -> List[MarriageRecord]:
@@ -543,18 +565,18 @@ class QQWifeDB:
     async def clear_group_roster(self, group_id: str) -> None:
         await self._ensure_conn()
         assert self.conn is not None
-        await self.conn.execute("DELETE FROM marriages WHERE group_id = ?", (group_id,))
-        await self.conn.execute("DELETE FROM cd_records WHERE group_id = ?", (group_id,))
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute("DELETE FROM marriages WHERE group_id = ?", (group_id,))
+            await self.conn.execute("DELETE FROM cd_records WHERE group_id = ?", (group_id,))
 
     async def clear_all_rosters(self) -> None:
         await self._ensure_conn()
         assert self.conn is not None
-        await self.conn.execute("DELETE FROM marriages")
-        await self.conn.execute("DELETE FROM cd_records")
-        await self.conn.execute("DELETE FROM active_users")
-        await self.conn.execute("DELETE FROM group_settings")
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute("DELETE FROM marriages")
+            await self.conn.execute("DELETE FROM cd_records")
+            await self.conn.execute("DELETE FROM active_users")
+            await self.conn.execute("DELETE FROM group_settings")
 
     async def check_cd(self, group_id: str, user_id: str, mode_id: str, cd_hours: float) -> bool:
         await self._ensure_conn()
@@ -574,11 +596,11 @@ class QQWifeDB:
             return True
         last_ts = float(row["last_ts"] or 0.0)
         if dt.datetime.now().timestamp() - last_ts >= cd_hours * 3600:
-            await self.conn.execute(
-                "DELETE FROM cd_records WHERE group_id = ? AND user_id = ? AND mode_id = ?",
-                (group_id, user_id, mode_id),
-            )
-            await self._commit_if_needed()
+            async with self.transaction():
+                await self.conn.execute(
+                    "DELETE FROM cd_records WHERE group_id = ? AND user_id = ? AND mode_id = ?",
+                    (group_id, user_id, mode_id),
+                )
             return True
         return False
 
@@ -586,16 +608,16 @@ class QQWifeDB:
         await self._ensure_conn()
         assert self.conn is not None
         now = dt.datetime.now().timestamp()
-        await self.conn.execute(
-            """
-            INSERT INTO cd_records (group_id, user_id, mode_id, last_ts)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(group_id, user_id, mode_id) DO UPDATE SET
-                last_ts = excluded.last_ts
-            """,
-            (group_id, user_id, mode_id, now),
-        )
-        await self._commit_if_needed()
+        async with self.transaction():
+            await self.conn.execute(
+                """
+                INSERT INTO cd_records (group_id, user_id, mode_id, last_ts)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(group_id, user_id, mode_id) DO UPDATE SET
+                    last_ts = excluded.last_ts
+                """,
+                (group_id, user_id, mode_id, now),
+            )
 
     async def get_favor(self, uid: str, target: str) -> int:
         await self._ensure_conn()
@@ -619,24 +641,24 @@ class QQWifeDB:
         await self._ensure_conn()
         assert self.conn is not None
         user_a, user_b = canonical_pair(uid, target)
-        async with self.conn.execute(
-            "SELECT favor FROM favorability WHERE user_a = ? AND user_b = ? LIMIT 1",
-            (user_a, user_b),
-        ) as cursor:
-            row = await cursor.fetchone()
-        base = int(row["favor"]) if row else 0
-        value = max(0, min(100, base + int(score)))
-        await self.conn.execute(
-            """
-            INSERT INTO favorability (user_a, user_b, favor)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_a, user_b) DO UPDATE SET
-                favor = excluded.favor
-            """,
-            (user_a, user_b, value),
-        )
-        await self._commit_if_needed()
-        return value
+        async with self.transaction():
+            async with self.conn.execute(
+                "SELECT favor FROM favorability WHERE user_a = ? AND user_b = ? LIMIT 1",
+                (user_a, user_b),
+            ) as cursor:
+                row = await cursor.fetchone()
+            base = int(row["favor"]) if row else 0
+            value = max(0, min(100, base + int(score)))
+            await self.conn.execute(
+                """
+                INSERT INTO favorability (user_a, user_b, favor)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_a, user_b) DO UPDATE SET
+                    favor = excluded.favor
+                """,
+                (user_a, user_b, value),
+            )
+            return value
 
     async def list_favor_for_user(self, uid: str, limit: int = 10) -> List[Tuple[str, int]]:
         await self._ensure_conn()
@@ -701,59 +723,51 @@ class QQWifeDB:
 
     async def change_balance(self, user_id: str, delta: int) -> Tuple[bool, int]:
         await self._ensure_conn()
-        assert self.conn is not None
         if delta == 0:
             return True, await self.get_balance(user_id)
 
-        own_tx = not self._in_transaction()
-        try:
-            if own_tx:
-                await self.conn.execute("BEGIN IMMEDIATE")
+        if self._in_transaction():
+            return await self._change_balance_in_tx(user_id, delta)
+        async with self.transaction():
+            return await self._change_balance_in_tx(user_id, delta)
 
-            if delta < 0:
-                await self.conn.execute(
-                    """
-                    UPDATE wallet.wallet_data
-                    SET coins = coins + ?
-                    WHERE user_id = ? AND coins + ? >= 0
-                    """,
-                    (delta, user_id, delta),
-                )
-                async with self.conn.execute("SELECT changes() AS cnt") as cursor:
-                    row = await cursor.fetchone()
-                changed = int(row["cnt"]) if row else 0
-                if changed == 0:
-                    async with self.conn.execute(
-                        "SELECT coins FROM wallet.wallet_data WHERE user_id = ?",
-                        (user_id,),
-                    ) as cursor:
-                        row = await cursor.fetchone()
-                    if own_tx:
-                        await self.conn.rollback()
-                    return False, int(row["coins"]) if row else 0
-            else:
-                await self.conn.execute(
-                    "INSERT OR IGNORE INTO wallet.wallet_data (user_id, coins) VALUES (?, 0)",
-                    (user_id,),
-                )
-                await self.conn.execute(
-                    "UPDATE wallet.wallet_data SET coins = coins + ? WHERE user_id = ?",
-                    (delta, user_id),
-                )
-
-            async with self.conn.execute(
-                "SELECT coins FROM wallet.wallet_data WHERE user_id = ?",
-                (user_id,),
-            ) as cursor:
+    async def _change_balance_in_tx(self, user_id: str, delta: int) -> Tuple[bool, int]:
+        assert self.conn is not None
+        if delta < 0:
+            await self.conn.execute(
+                """
+                UPDATE wallet.wallet_data
+                SET coins = coins + ?
+                WHERE user_id = ? AND coins + ? >= 0
+                """,
+                (delta, user_id, delta),
+            )
+            async with self.conn.execute("SELECT changes() AS cnt") as cursor:
                 row = await cursor.fetchone()
-            balance = int(row["coins"]) if row else 0
-            if own_tx:
-                await self.conn.commit()
-            return True, balance
-        except Exception:
-            if own_tx:
-                await self.conn.rollback()
-            raise
+            changed = int(row["cnt"]) if row else 0
+            if changed == 0:
+                async with self.conn.execute(
+                    "SELECT coins FROM wallet.wallet_data WHERE user_id = ?",
+                    (user_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                return False, int(row["coins"]) if row else 0
+        else:
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO wallet.wallet_data (user_id, coins) VALUES (?, 0)",
+                (user_id,),
+            )
+            await self.conn.execute(
+                "UPDATE wallet.wallet_data SET coins = coins + ? WHERE user_id = ?",
+                (delta, user_id),
+            )
+
+        async with self.conn.execute(
+            "SELECT coins FROM wallet.wallet_data WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return True, int(row["coins"]) if row else 0
 
 
 QQWIFE_DB = QQWifeDB()

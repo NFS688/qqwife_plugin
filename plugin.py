@@ -599,16 +599,16 @@ class QQWifeProposeCommand(QQWifeBaseCommand):
                     if not await self.validate_single_propose(gid, uid, target_id, settings):
                         return True, "validate_failed", 1
 
-                    await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
-
                     if target_id == uid:
                         if random.randint(0, 2) == 1:
                             ok = await QQWIFE_DB.register_marriage(gid, uid, "0", uname, "")
                             if ok:
+                                await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
                                 await self.send_text("今日获得成就：单身贵族")
                             else:
                                 await self.send_text("系统繁忙，请稍后再试。")
                             return True, "single_noble", 1
+                        await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
                         await self.send_text("今日获得成就：自恋狂")
                         return True, "self_love", 1
 
@@ -616,6 +616,7 @@ class QQWifeProposeCommand(QQWifeBaseCommand):
                     if favor < 30:
                         favor = 30
                     if random.randint(0, 100) >= favor:
+                        await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
                         await self.send_text(random.choice(FAIL_TEXTS))
                         return True, "failed", 1
 
@@ -631,6 +632,7 @@ class QQWifeProposeCommand(QQWifeBaseCommand):
                         return True, "race_lost", 1
 
                     favor = await QQWIFE_DB.update_favor(uid, target_id, random.randint(1, 5))
+                    await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
                     await self.send_text(
                         f"{random.choice(SUCCESS_TEXTS)}\n\n今天你的{relation}是\n[{target_name}]({target_id})\n当前你们好感度为 {favor}"
                     )
@@ -675,9 +677,8 @@ class QQWifeMistressCommand(QQWifeBaseCommand):
                         if not await self.validate_mistress(gid, uid, target_id, settings):
                             return True, "validate_failed", 1
 
-                        await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
-
                         if target_id == uid:
+                            await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
                             await self.send_text("今日获得成就：自我攻略")
                             return True, "self_attack", 1
 
@@ -686,6 +687,7 @@ class QQWifeMistressCommand(QQWifeBaseCommand):
                             favor = 30
                         threshold = max(1, favor // 3)
                         if random.randint(0, 100) >= threshold:
+                            await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
                             await self.send_text("失败了，可惜。")
                             return True, "failed", 1
 
@@ -730,6 +732,7 @@ class QQWifeMistressCommand(QQWifeBaseCommand):
                         if green_id and green_id != "0":
                             await QQWIFE_DB.update_favor(uid, green_id, 5)
 
+                        await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
                         target_name = await self.display_name(gid, target_id, target_id)
                         await self.send_text(
                             f"{random.choice(NTR_SUCCESS_TEXTS)}\n\n今天你的群{relation_text}是\n"
@@ -777,14 +780,13 @@ class QQWifeMatchmakerCommand(QQWifeBaseCommand):
                     if not await self.validate_matchmaker(gid, uid, left_id, right_id):
                         return True, "validate_failed", 1
 
-                    await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
-
                     favor = await QQWIFE_DB.get_favor(left_id, right_id)
                     if favor < 30:
                         favor = 30
                     if random.randint(0, 100) >= favor:
                         await QQWIFE_DB.update_favor(uid, left_id, -1)
                         await QQWIFE_DB.update_favor(uid, right_id, -1)
+                        await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
                         await self.send_text(random.choice(FAIL_TEXTS))
                         return True, "failed", 1
 
@@ -798,6 +800,7 @@ class QQWifeMatchmakerCommand(QQWifeBaseCommand):
                     await QQWIFE_DB.update_favor(uid, left_id, 1)
                     await QQWIFE_DB.update_favor(uid, right_id, 1)
                     await QQWIFE_DB.update_favor(left_id, right_id, 1)
+                    await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
 
                     await self.send_text(
                         "恭喜你成功撮合了一对CP。\n"
@@ -852,11 +855,11 @@ class QQWifeDivorceCommand(QQWifeBaseCommand):
                         await self.send_text("婚姻数据异常。")
                         return True, "invalid_data", 1
 
-                    await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
                     favor = await QQWIFE_DB.get_favor(uid, spouse_id)
                     if favor < 20:
                         favor = 10
                     if random.randint(0, 100) > (110 - favor):
+                        await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
                         await self.send_text(random.choice(DIVORCE_FAIL_TEXTS))
                         return True, "failed", 1
 
@@ -868,6 +871,7 @@ class QQWifeDivorceCommand(QQWifeBaseCommand):
                         await self.send_text("离婚失败，记录可能已被修改。")
                         return True, "not_found", 1
 
+                    await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
                     await self.send_text(random.choice(DIVORCE_SUCCESS_TEXTS))
                     return True, "ok", 1
 
