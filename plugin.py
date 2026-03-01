@@ -13,10 +13,12 @@ from src.plugin_system import (
     ConfigField,
     EventType,
     MaiMessages,
+    ReplyContentType,
     register_plugin,
 )
 
 from .database import GroupSettings, MarriageRecord, QQWIFE_DB
+from .draw import generate_roster_image, generate_favor_image, fetch_avatar_base64
 
 logger = get_logger("qqwife_plugin")
 
@@ -142,6 +144,13 @@ class QQWifeBaseCommand(BaseCommand):
         except Exception:
             value = 30
         return max(5, min(200, value))
+
+    def get_roster_max_entries(self) -> int:
+        try:
+            value = int(self.get_config("components.roster_max_entries", 15))
+        except Exception:
+            value = 15
+        return max(10, min(500, value))
 
     def get_gift_max_cost(self) -> int:
         try:
@@ -330,12 +339,11 @@ class QQWifeBaseCommand(BaseCommand):
         user_id: str,
         mode_id: str,
         settings: GroupSettings,
-    ) -> bool:
+    ) -> Tuple[bool, Optional[str]]:
         ok = await QQWIFE_DB.check_cd(group_id, user_id, mode_id, settings.cd_hours)
         if ok:
-            return True
-        await self.send_text("你的技能还在CD中。")
-        return False
+            return True, None
+        return False, "你的技能还在CD中。"
 
     async def validate_single_propose(
         self,
@@ -343,36 +351,28 @@ class QQWifeBaseCommand(BaseCommand):
         user_id: str,
         target_id: str,
         settings: GroupSettings,
-    ) -> bool:
+    ) -> Tuple[bool, Optional[str]]:
         if settings.can_match == 0:
-            await self.send_text("本群已禁止自由恋爱。")
-            return False
+            return False, "本群已禁止自由恋爱。"
 
         user_info = await QQWIFE_DB.get_member_marriage(group_id, user_id)
         if is_single_noble(user_info):
-            await self.send_text("今天的你是单身贵族哦。")
-            return False
+            return False, "今天的你是单身贵族哦。"
         if user_info and (user_info.user_id == target_id or user_info.target_id == target_id):
-            await self.send_text("笨蛋！你们已经在一起了。")
-            return False
+            return False, "笨蛋！你们已经在一起了。"
         if user_info and user_info.user_id == user_id:
-            await self.send_text("笨蛋，你家里还有个吃白饭的。")
-            return False
+            return False, "笨蛋，你家里还有个吃白饭的。"
         if user_info and user_info.target_id == user_id:
-            await self.send_text("你今天已经是0了，别折腾了。")
-            return False
+            return False, "你今天已经是0了，别折腾了。"
 
         target_info = await QQWIFE_DB.get_member_marriage(group_id, target_id)
         if is_single_noble(target_info):
-            await self.send_text("今天的 ta 是单身贵族哦。")
-            return False
+            return False, "今天的 ta 是单身贵族哦。"
         if target_info and target_info.user_id == target_id:
-            await self.send_text("ta有对象了，你该放下了。")
-            return False
+            return False, "ta有对象了，你该放下了。"
         if target_info and target_info.target_id == target_id:
-            await self.send_text("ta被别人娶了，你来晚啦。")
-            return False
-        return True
+            return False, "ta被别人娶了，你来晚啦。"
+        return True, None
 
     async def validate_mistress(
         self,
@@ -380,33 +380,26 @@ class QQWifeBaseCommand(BaseCommand):
         user_id: str,
         target_id: str,
         settings: GroupSettings,
-    ) -> bool:
+    ) -> Tuple[bool, Optional[str]]:
         if settings.can_ntr == 0:
-            await self.send_text("本群已禁止牛头人行为。")
-            return False
+            return False, "本群已禁止牛头人行为。"
 
         target_info = await QQWIFE_DB.get_member_marriage(group_id, target_id)
         if target_info is None:
-            await self.send_text("ta现在还是单身，快向ta表白吧。")
-            return False
+            return False, "ta现在还是单身，快向ta表白吧。"
         if is_single_noble(target_info):
-            await self.send_text("今天的 ta 是单身贵族哦。")
-            return False
+            return False, "今天的 ta 是单身贵族哦。"
         if target_info.user_id == user_id or target_info.target_id == user_id:
-            await self.send_text("笨蛋！你们已经在一起了。")
-            return False
+            return False, "笨蛋！你们已经在一起了。"
 
         user_info = await QQWIFE_DB.get_member_marriage(group_id, user_id)
         if is_single_noble(user_info):
-            await self.send_text("今天的你是单身贵族哦。")
-            return False
+            return False, "今天的你是单身贵族哦。"
         if user_info and user_info.user_id == user_id:
-            await self.send_text("不允许纳小三。")
-            return False
+            return False, "不允许纳小三。"
         if user_info and user_info.target_id == user_id:
-            await self.send_text("你今天已经是0了，别折腾了。")
-            return False
-        return True
+            return False, "你今天已经是0了，别折腾了。"
+        return True, None
 
     async def validate_matchmaker(
         self,
@@ -414,33 +407,26 @@ class QQWifeBaseCommand(BaseCommand):
         user_id: str,
         left_id: str,
         right_id: str,
-    ) -> bool:
+    ) -> Tuple[bool, Optional[str]]:
         if left_id == user_id or right_id == user_id:
-            await self.send_text("禁止给自己做媒。")
-            return False
+            return False, "禁止给自己做媒。"
         if left_id == right_id:
-            await self.send_text("你这媒人有点怪，不能这样配。")
-            return False
+            return False, "你这媒人有点怪，不能这样配。"
 
         left_info = await QQWIFE_DB.get_member_marriage(group_id, left_id)
         if is_single_noble(left_info):
-            await self.send_text("今天的攻方是单身贵族。")
-            return False
+            return False, "今天的攻方是单身贵族。"
         if left_info and (left_info.target_id == right_id or left_info.user_id == right_id):
-            await self.send_text("笨蛋，ta们已经在一起了。")
-            return False
+            return False, "笨蛋，ta们已经在一起了。"
         if left_info is not None:
-            await self.send_text("攻方不是单身，不允许给这种人做媒。")
-            return False
+            return False, "攻方不是单身，不允许给这种人做媒。"
 
         right_info = await QQWIFE_DB.get_member_marriage(group_id, right_id)
         if is_single_noble(right_info):
-            await self.send_text("今天的受方是单身贵族。")
-            return False
+            return False, "今天的受方是单身贵族。"
         if right_info is not None:
-            await self.send_text("受方不是单身，不允许给这种人做媒。")
-            return False
-        return True
+            return False, "受方不是单身，不允许给这种人做媒。"
+        return True, None
 
 
 class QQWifeRandomCommand(QQWifeBaseCommand):
@@ -456,6 +442,9 @@ class QQWifeRandomCommand(QQWifeBaseCommand):
         uid = self.get_user_id()
         uname = self.get_user_name()
         platform = self.get_platform()
+        result_code = "ok"
+        text_msg = ""
+        avatar_target_id: Optional[str] = None
 
         async with self.guard_group_operation(gid) as locked:
             if not locked:
@@ -467,70 +456,85 @@ class QQWifeRandomCommand(QQWifeBaseCommand):
 
                 status = await QQWIFE_DB.get_member_marriage(gid, uid)
                 if is_single_noble(status):
-                    await self.send_text("今天你是单身贵族。")
-                    return True, "single_noble", 1
-                if status and status.user_id == uid:
+                    text_msg = "今天你是单身贵族。"
+                    result_code = "single_noble"
+                elif status and status.user_id == uid:
                     name = status.target_name or await self.display_name(gid, status.target_id, status.target_id)
-                    await self.send_text(f"今天你在 {status.married_at} 娶了群友\n[{name}]({status.target_id})")
-                    return True, "already_husband", 1
-                if status and status.target_id == uid:
+                    text_msg = f"今天你在 {status.married_at} 娶了群友\n[{name}]({status.target_id})"
+                    result_code = "already_husband"
+                elif status and status.target_id == uid:
                     name = status.username or await self.display_name(gid, status.user_id, status.user_id)
-                    await self.send_text(f"今天你在 {status.married_at} 被群友\n[{name}]({status.user_id}) 娶了")
-                    return True, "already_wife", 1
-
-                married_ids = await QQWIFE_DB.get_married_member_ids(gid)
-                candidates = await QQWIFE_DB.get_recent_active_users(
-                    gid,
-                    limit=self.get_candidate_pool_size(),
-                    exclude_user_ids=tuple(married_ids),
-                )
-                if self.allow_message_fallback_candidates() and len(candidates) < 2:
-                    fallback = await QQWIFE_DB.get_recent_group_speakers_from_messages(
+                    text_msg = f"今天你在 {status.married_at} 被群友\n[{name}]({status.user_id}) 娶了"
+                    result_code = "already_wife"
+                else:
+                    married_ids = await QQWIFE_DB.get_married_member_ids(gid)
+                    candidates = await QQWIFE_DB.get_recent_active_users(
                         gid,
-                        platform,
                         limit=self.get_candidate_pool_size(),
                         exclude_user_ids=tuple(married_ids),
                     )
-                    exists = {item.user_id for item in candidates}
-                    for item in fallback:
-                        if item.user_id in exists:
-                            continue
-                        candidates.append(item)
-                        exists.add(item.user_id)
-                        if len(candidates) >= self.get_candidate_pool_size():
-                            break
+                    if self.allow_message_fallback_candidates() and len(candidates) < 2:
+                        fallback = await QQWIFE_DB.get_recent_group_speakers_from_messages(
+                            gid,
+                            platform,
+                            limit=self.get_candidate_pool_size(),
+                            exclude_user_ids=tuple(married_ids),
+                        )
+                        exists = {item.user_id for item in candidates}
+                        for item in fallback:
+                            if item.user_id in exists:
+                                continue
+                            candidates.append(item)
+                            exists.add(item.user_id)
+                            if len(candidates) >= self.get_candidate_pool_size():
+                                break
 
-                if not candidates:
-                    await self.send_text("群里暂无可匹配对象，先多聊聊再来试试。")
-                    return True, "no_candidate", 1
+                    if not candidates:
+                        text_msg = "群里暂无可匹配对象，先多聊聊再来试试。"
+                        result_code = "no_candidate"
+                    elif len(candidates) == 1 and candidates[0].user_id == uid:
+                        text_msg = "群里没有ta人是单身了，明天再试试吧。"
+                        result_code = "only_self"
+                    else:
+                        fiancee = random.choice(candidates)
+                        fid = str(fiancee.user_id)
+                        fname = fiancee.nickname or await self.display_name(gid, fid, fid)
 
-                if len(candidates) == 1 and candidates[0].user_id == uid:
-                    await self.send_text("群里没有ta人是单身了，明天再试试吧。")
-                    return True, "only_self", 1
-
-                fiancee = random.choice(candidates)
-                fid = str(fiancee.user_id)
-                fname = fiancee.nickname or await self.display_name(gid, fid, fid)
-
-                if fid == uid:
-                    if random.randint(0, 9) == 1:
-                        ok = await QQWIFE_DB.register_marriage(gid, uid, "0", uname, "")
-                        if ok:
-                            await self.send_text("今日获得成就：单身贵族")
+                        if fid == uid:
+                            if random.randint(0, 9) == 1:
+                                ok = await QQWIFE_DB.register_marriage(gid, uid, "0", uname, "")
+                                if ok:
+                                    text_msg = "今日获得成就：单身贵族"
+                                    result_code = "single_noble_roll"
+                                else:
+                                    text_msg = "系统繁忙，请稍后再试。"
+                                    result_code = "single_noble_roll_failed"
+                            else:
+                                text_msg = "唔，没娶到，你可以再试一次。"
+                                result_code = "self_miss"
                         else:
-                            await self.send_text("系统繁忙，请稍后再试。")
-                        return True, "single_noble_roll", 1
-                    await self.send_text("唔，没娶到，你可以再试一次。")
-                    return True, "self_miss", 1
+                            ok = await QQWIFE_DB.register_marriage(gid, uid, fid, uname, fname)
+                            if not ok:
+                                text_msg = "ta好像刚被别人抢先一步了，稍后再试试。"
+                                result_code = "race_lost"
+                            else:
+                                favor = await QQWIFE_DB.update_favor(uid, fid, random.randint(1, 5))
+                                text_msg = f"今天你的群老婆是\n[{fname}]({fid})\n当前你们好感度为 {favor}"
+                                avatar_target_id = fid
+                                result_code = "ok"
 
-                ok = await QQWIFE_DB.register_marriage(gid, uid, fid, uname, fname)
-                if not ok:
-                    await self.send_text("ta好像刚被别人抢先一步了，稍后再试试。")
-                    return True, "race_lost", 1
-
-                favor = await QQWIFE_DB.update_favor(uid, fid, random.randint(1, 5))
-                await self.send_text(f"今天你的群老婆是\n[{fname}]({fid})\n当前你们好感度为 {favor}")
-                return True, "ok", 1
+        if avatar_target_id:
+            try:
+                avatar_b64 = await fetch_avatar_base64(avatar_target_id)
+                await self.send_hybrid(
+                    [(ReplyContentType.IMAGE, avatar_b64), (ReplyContentType.TEXT, text_msg)]
+                )
+            except Exception as e:
+                logger.error(f"Random attach avatar error: {e}")
+                await self.send_text(text_msg)
+        else:
+            await self.send_text(text_msg)
+        return True, result_code, 1
 
 
 class QQWifeRosterCommand(QQWifeBaseCommand):
@@ -543,20 +547,40 @@ class QQWifeRosterCommand(QQWifeBaseCommand):
             return True, "group_only", 1
 
         gid = self.get_group_id()
+        roster_limit = self.get_roster_max_entries()
         async with QQWIFE_DB.transaction():
             await self.ensure_daily(gid)
-            records = await QQWIFE_DB.list_group_marriages(gid, include_single=False)
+            records = await QQWIFE_DB.list_group_marriages(gid, include_single=False, limit=roster_limit + 1)
+
+        truncated = len(records) > roster_limit
+        if truncated:
+            records = records[:roster_limit]
 
         if not records:
             await self.send_text("今天还没有人结婚。")
             return True, "empty", 1
 
-        lines = ["群老婆列表", "--------------------"]
-        for idx, item in enumerate(records, start=1):
-            left = item.username or await self.display_name(gid, item.user_id, item.user_id)
-            right = item.target_name or await self.display_name(gid, item.target_id, item.target_id)
-            lines.append(f"{idx}. {left}({item.user_id}) -> {right}({item.target_id})")
-        await self.send_text("\n".join(lines))
+        header_hint = (
+            f"群老婆列表（仅展示前 {roster_limit} 条，完整数据请调整 roster_max_entries 配置）"
+            if truncated
+            else ""
+        )
+        try:
+            title = f"群老婆列表（前 {roster_limit} 条）" if truncated else "群老婆列表"
+            b64_img = await generate_roster_image(records, title=title)
+            if header_hint:
+                await self.send_text(header_hint)
+            await self.send_image(b64_img)
+        except Exception as e:
+            logger.error(f"Generate roster image error: {e}")
+            lines = ["群老婆列表", "--------------------"]
+            if header_hint:
+                lines.append(header_hint)
+            for idx, item in enumerate(records, start=1):
+                left = item.username or await self.display_name(gid, item.user_id, item.user_id)
+                right = item.target_name or await self.display_name(gid, item.target_id, item.target_id)
+                lines.append(f"{idx}. {left}({item.user_id}) <----> {right}({item.target_id})")
+            await self.send_text("\n".join(lines))
         return True, "ok", 1
 
 
@@ -580,6 +604,9 @@ class QQWifeProposeCommand(QQWifeBaseCommand):
         uid = self.get_user_id()
         uname = self.get_user_name()
         user_lock_key = f"{gid}:{uid}"
+        result_code = "ok"
+        text_msg = ""
+        avatar_target_id: Optional[str] = None
 
         async with self.guard_user_operation(user_lock_key) as user_locked:
             if not user_locked:
@@ -593,50 +620,69 @@ class QQWifeProposeCommand(QQWifeBaseCommand):
                     await QQWIFE_DB.upsert_active_user(gid, uid, uname)
                     settings = await self.ensure_daily(gid)
 
-                    if not await self.check_cd_or_reply(gid, uid, MODE_PROPOSE, settings):
-                        return True, "cd", 1
-
-                    if not await self.validate_single_propose(gid, uid, target_id, settings):
-                        return True, "validate_failed", 1
-
-                    if target_id == uid:
-                        if random.randint(0, 2) == 1:
-                            ok = await QQWIFE_DB.register_marriage(gid, uid, "0", uname, "")
-                            if ok:
-                                await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
-                                await self.send_text("今日获得成就：单身贵族")
-                            else:
-                                await self.send_text("系统繁忙，请稍后再试。")
-                            return True, "single_noble", 1
-                        await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
-                        await self.send_text("今日获得成就：自恋狂")
-                        return True, "self_love", 1
-
-                    favor = await QQWIFE_DB.get_favor(uid, target_id)
-                    if favor < 30:
-                        favor = 30
-                    if random.randint(0, 100) >= favor:
-                        await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
-                        await self.send_text(random.choice(FAIL_TEXTS))
-                        return True, "failed", 1
-
-                    target_name = await self.display_name(gid, target_id, target_id)
-                    if action == "娶":
-                        ok = await QQWIFE_DB.register_marriage(gid, uid, target_id, uname, target_name)
-                        relation = "群老婆"
+                    cd_ok, cd_msg = await self.check_cd_or_reply(gid, uid, MODE_PROPOSE, settings)
+                    if not cd_ok:
+                        text_msg = cd_msg or "你的技能还在CD中。"
+                        result_code = "cd"
                     else:
-                        ok = await QQWIFE_DB.register_marriage(gid, target_id, uid, target_name, uname)
-                        relation = "群老公"
-                    if not ok:
-                        await self.send_text("ta刚被别人抢先一步了。")
-                        return True, "race_lost", 1
+                        valid, valid_msg = await self.validate_single_propose(gid, uid, target_id, settings)
+                        if not valid:
+                            text_msg = valid_msg or "条件不满足。"
+                            result_code = "validate_failed"
+                        elif target_id == uid:
+                            if random.randint(0, 2) == 1:
+                                ok = await QQWIFE_DB.register_marriage(gid, uid, "0", uname, "")
+                                if ok:
+                                    await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
+                                    text_msg = "今日获得成就：单身贵族"
+                                    result_code = "single_noble"
+                                else:
+                                    text_msg = "系统繁忙，请稍后再试。"
+                                    result_code = "single_noble_failed"
+                            else:
+                                await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
+                                text_msg = "今日获得成就：自恋狂"
+                                result_code = "self_love"
+                        else:
+                            favor = await QQWIFE_DB.get_favor(uid, target_id)
+                            if favor < 30:
+                                favor = 30
+                            if random.randint(0, 100) >= favor:
+                                await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
+                                text_msg = random.choice(FAIL_TEXTS)
+                                result_code = "failed"
+                            else:
+                                target_name = await self.display_name(gid, target_id, target_id)
+                                if action == "娶":
+                                    ok = await QQWIFE_DB.register_marriage(gid, uid, target_id, uname, target_name)
+                                    relation = "群老婆"
+                                else:
+                                    ok = await QQWIFE_DB.register_marriage(gid, target_id, uid, target_name, uname)
+                                    relation = "群老公"
+                                if not ok:
+                                    text_msg = "ta刚被别人抢先一步了。"
+                                    result_code = "race_lost"
+                                else:
+                                    favor = await QQWIFE_DB.update_favor(uid, target_id, random.randint(1, 5))
+                                    await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
+                                    text_msg = (
+                                        f"{random.choice(SUCCESS_TEXTS)}\n\n今天你的{relation}是\n[{target_name}]({target_id})\n当前你们好感度为 {favor}"
+                                    )
+                                    avatar_target_id = target_id
+                                    result_code = "ok"
 
-                    favor = await QQWIFE_DB.update_favor(uid, target_id, random.randint(1, 5))
-                    await QQWIFE_DB.record_cd(gid, uid, MODE_PROPOSE)
-                    await self.send_text(
-                        f"{random.choice(SUCCESS_TEXTS)}\n\n今天你的{relation}是\n[{target_name}]({target_id})\n当前你们好感度为 {favor}"
-                    )
-                    return True, "ok", 1
+        if avatar_target_id:
+            try:
+                avatar_b64 = await fetch_avatar_base64(avatar_target_id)
+                await self.send_hybrid(
+                    [(ReplyContentType.IMAGE, avatar_b64), (ReplyContentType.TEXT, text_msg + "\n")]
+                )
+            except Exception as e:
+                logger.error(f"Propose attach avatar error: {e}")
+                await self.send_text(text_msg)
+        else:
+            await self.send_text(text_msg)
+        return True, result_code, 1
 
 
 class QQWifeMistressCommand(QQWifeBaseCommand):
@@ -658,6 +704,9 @@ class QQWifeMistressCommand(QQWifeBaseCommand):
         uid = self.get_user_id()
         uname = self.get_user_name()
         user_lock_key = f"{gid}:{uid}"
+        result_code = "ok"
+        text_msg = ""
+        avatar_target_id: Optional[str] = None
 
         async with self.guard_user_operation(user_lock_key) as user_locked:
             if not user_locked:
@@ -672,76 +721,96 @@ class QQWifeMistressCommand(QQWifeBaseCommand):
                         await QQWIFE_DB.upsert_active_user(gid, uid, uname)
                         settings = await self.ensure_daily(gid)
 
-                        if not await self.check_cd_or_reply(gid, uid, MODE_MISTRESS, settings):
-                            return True, "cd", 1
-                        if not await self.validate_mistress(gid, uid, target_id, settings):
-                            return True, "validate_failed", 1
-
-                        if target_id == uid:
-                            await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
-                            await self.send_text("今日获得成就：自我攻略")
-                            return True, "self_attack", 1
-
-                        favor = await QQWIFE_DB.get_favor(uid, target_id)
-                        if favor < 30:
-                            favor = 30
-                        threshold = max(1, favor // 3)
-                        if random.randint(0, 100) >= threshold:
-                            await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
-                            await self.send_text("失败了，可惜。")
-                            return True, "failed", 1
-
-                        target_info = await QQWIFE_DB.get_member_marriage(gid, target_id)
-                        if target_info is None:
-                            await self.send_text("数据已变化，请重试。")
-                            return True, "not_found", 1
-
-                        ntr_user_id = uid
-                        new_target_id = target_id
-                        green_id = ""
-                        relation_text = "老婆"
-
-                        if target_info.user_id == target_id:
-                            old_partner = target_info.target_id
-                            removed = await QQWIFE_DB.delete_marriage_by_user(gid, target_id)
-                            if not removed:
-                                raise RuntimeError("ta不想和原来的对象分手。")
-                            ntr_user_id = target_id
-                            new_target_id = uid
-                            green_id = old_partner
-                            relation_text = "老公"
-                        elif target_info.target_id == target_id:
-                            old_partner = target_info.user_id
-                            removed = await QQWIFE_DB.delete_marriage_by_target(gid, target_id)
-                            if not removed:
-                                raise RuntimeError("ta不想和原来的对象分手。")
-                            ntr_user_id = uid
-                            new_target_id = target_id
-                            green_id = old_partner
-                            relation_text = "老婆"
+                        cd_ok, cd_msg = await self.check_cd_or_reply(gid, uid, MODE_MISTRESS, settings)
+                        if not cd_ok:
+                            text_msg = cd_msg or "你的技能还在CD中。"
+                            result_code = "cd"
                         else:
-                            raise RuntimeError("婚姻数据异常。")
+                            valid, valid_msg = await self.validate_mistress(gid, uid, target_id, settings)
+                            if not valid:
+                                text_msg = valid_msg or "条件不满足。"
+                                result_code = "validate_failed"
+                            else:
+                                favor = await QQWIFE_DB.get_favor(uid, target_id)
+                                if favor < 30:
+                                    favor = 30
+                                threshold = max(1, favor // 3)
+                                if random.randint(0, 100) >= threshold:
+                                    await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
+                                    text_msg = "失败了，可惜。"
+                                    result_code = "failed"
+                                else:
+                                    target_info = await QQWIFE_DB.get_member_marriage(gid, target_id)
+                                    if target_info is None:
+                                        text_msg = "数据已变化，请重试。"
+                                        result_code = "not_found"
+                                    else:
+                                        ntr_user_id = uid
+                                        new_target_id = target_id
+                                        green_id = ""
+                                        relation_text = "老婆"
 
-                        ntr_name = await self.display_name(gid, ntr_user_id, ntr_user_id)
-                        new_target_name = await self.display_name(gid, new_target_id, new_target_id)
-                        ok = await QQWIFE_DB.register_marriage(gid, ntr_user_id, new_target_id, ntr_name, new_target_name)
-                        if not ok:
-                            raise RuntimeError("复婚登记失败，请稍后重试。")
+                                        if target_info.user_id == target_id:
+                                            old_partner = target_info.target_id
+                                            removed = await QQWIFE_DB.delete_marriage_by_user(gid, target_id)
+                                            if not removed:
+                                                raise RuntimeError("ta不想和原来的对象分手。")
+                                            ntr_user_id = target_id
+                                            new_target_id = uid
+                                            green_id = old_partner
+                                            relation_text = "老公"
+                                        elif target_info.target_id == target_id:
+                                            old_partner = target_info.user_id
+                                            removed = await QQWIFE_DB.delete_marriage_by_target(gid, target_id)
+                                            if not removed:
+                                                raise RuntimeError("ta不想和原来的对象分手。")
+                                            ntr_user_id = uid
+                                            new_target_id = target_id
+                                            green_id = old_partner
+                                            relation_text = "老婆"
+                                        else:
+                                            raise RuntimeError("婚姻数据异常。")
 
-                        favor = await QQWIFE_DB.update_favor(uid, target_id, -5)
-                        if green_id and green_id != "0":
-                            await QQWIFE_DB.update_favor(uid, green_id, 5)
+                                        ntr_name = await self.display_name(gid, ntr_user_id, ntr_user_id)
+                                        new_target_name = await self.display_name(gid, new_target_id, new_target_id)
+                                        ok = await QQWIFE_DB.register_marriage(
+                                            gid,
+                                            ntr_user_id,
+                                            new_target_id,
+                                            ntr_name,
+                                            new_target_name,
+                                        )
+                                        if not ok:
+                                            raise RuntimeError("复婚登记失败，请稍后重试。")
 
-                        await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
-                        target_name = await self.display_name(gid, target_id, target_id)
-                        await self.send_text(
-                            f"{random.choice(NTR_SUCCESS_TEXTS)}\n\n今天你的群{relation_text}是\n"
-                            f"[{target_name}]({target_id})\n当前你们好感度为 {favor}"
-                        )
-                        return True, "ok", 1
+                                        favor = await QQWIFE_DB.update_favor(uid, target_id, -5)
+                                        if green_id and green_id != "0":
+                                            await QQWIFE_DB.update_favor(uid, green_id, 5)
+
+                                        await QQWIFE_DB.record_cd(gid, uid, MODE_MISTRESS)
+                                        target_name = await self.display_name(gid, target_id, target_id)
+                                        text_msg = (
+                                            f"{random.choice(NTR_SUCCESS_TEXTS)}\n\n今天你的群{relation_text}是\n"
+                                            f"[{target_name}]({target_id})\n当前你们好感度为 {favor}"
+                                        )
+                                        avatar_target_id = target_id
+                                        result_code = "ok"
                 except RuntimeError as exc:
-                    await self.send_text(str(exc))
-                    return True, "failed", 1
+                    text_msg = str(exc)
+                    result_code = "failed"
+
+        if avatar_target_id:
+            try:
+                avatar_b64 = await fetch_avatar_base64(avatar_target_id)
+                await self.send_hybrid(
+                    [(ReplyContentType.IMAGE, avatar_b64), (ReplyContentType.TEXT, text_msg + "\n")]
+                )
+            except Exception as e:
+                logger.error(f"Mistress attach avatar error: {e}")
+                await self.send_text(text_msg)
+        else:
+            await self.send_text(text_msg)
+        return True, result_code, 1
 
 
 class QQWifeMatchmakerCommand(QQWifeBaseCommand):
@@ -763,6 +832,8 @@ class QQWifeMatchmakerCommand(QQWifeBaseCommand):
         uid = self.get_user_id()
         uname = self.get_user_name()
         user_lock_key = f"{gid}:{uid}"
+        result_code = "ok"
+        text_msg = ""
 
         async with self.guard_user_operation(user_lock_key) as user_locked:
             if not user_locked:
@@ -775,39 +846,47 @@ class QQWifeMatchmakerCommand(QQWifeBaseCommand):
                 async with QQWIFE_DB.transaction():
                     await QQWIFE_DB.upsert_active_user(gid, uid, uname)
                     settings = await self.ensure_daily(gid)
-                    if not await self.check_cd_or_reply(gid, uid, MODE_MATCHMAKER, settings):
-                        return True, "cd", 1
-                    if not await self.validate_matchmaker(gid, uid, left_id, right_id):
-                        return True, "validate_failed", 1
+                    cd_ok, cd_msg = await self.check_cd_or_reply(gid, uid, MODE_MATCHMAKER, settings)
+                    if not cd_ok:
+                        text_msg = cd_msg or "你的技能还在CD中。"
+                        result_code = "cd"
+                    else:
+                        valid, valid_msg = await self.validate_matchmaker(gid, uid, left_id, right_id)
+                        if not valid:
+                            text_msg = valid_msg or "条件不满足。"
+                            result_code = "validate_failed"
+                        else:
+                            favor = await QQWIFE_DB.get_favor(left_id, right_id)
+                            if favor < 30:
+                                favor = 30
+                            if random.randint(0, 100) >= favor:
+                                await QQWIFE_DB.update_favor(uid, left_id, -1)
+                                await QQWIFE_DB.update_favor(uid, right_id, -1)
+                                await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
+                                text_msg = random.choice(FAIL_TEXTS)
+                                result_code = "failed"
+                            else:
+                                left_name = await self.display_name(gid, left_id, left_id)
+                                right_name = await self.display_name(gid, right_id, right_id)
+                                ok = await QQWIFE_DB.register_marriage(gid, left_id, right_id, left_name, right_name)
+                                if not ok:
+                                    text_msg = "做媒失败，ta们可能刚被别人抢先了。"
+                                    result_code = "race_lost"
+                                else:
+                                    await QQWIFE_DB.update_favor(uid, left_id, 1)
+                                    await QQWIFE_DB.update_favor(uid, right_id, 1)
+                                    await QQWIFE_DB.update_favor(left_id, right_id, 1)
+                                    await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
 
-                    favor = await QQWIFE_DB.get_favor(left_id, right_id)
-                    if favor < 30:
-                        favor = 30
-                    if random.randint(0, 100) >= favor:
-                        await QQWIFE_DB.update_favor(uid, left_id, -1)
-                        await QQWIFE_DB.update_favor(uid, right_id, -1)
-                        await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
-                        await self.send_text(random.choice(FAIL_TEXTS))
-                        return True, "failed", 1
+                                    text_msg = (
+                                        "恭喜你成功撮合了一对CP。\n"
+                                        f"攻方: [{left_name}]({left_id})\n"
+                                        f"受方: [{right_name}]({right_id})"
+                                    )
+                                    result_code = "ok"
 
-                    left_name = await self.display_name(gid, left_id, left_id)
-                    right_name = await self.display_name(gid, right_id, right_id)
-                    ok = await QQWIFE_DB.register_marriage(gid, left_id, right_id, left_name, right_name)
-                    if not ok:
-                        await self.send_text("做媒失败，ta们可能刚被别人抢先了。")
-                        return True, "race_lost", 1
-
-                    await QQWIFE_DB.update_favor(uid, left_id, 1)
-                    await QQWIFE_DB.update_favor(uid, right_id, 1)
-                    await QQWIFE_DB.update_favor(left_id, right_id, 1)
-                    await QQWIFE_DB.record_cd(gid, uid, MODE_MATCHMAKER)
-
-                    await self.send_text(
-                        "恭喜你成功撮合了一对CP。\n"
-                        f"攻方: [{left_name}]({left_id})\n"
-                        f"受方: [{right_name}]({right_id})"
-                    )
-                    return True, "ok", 1
+        await self.send_text(text_msg)
+        return True, result_code, 1
 
 
 class QQWifeDivorceCommand(QQWifeBaseCommand):
@@ -823,6 +902,8 @@ class QQWifeDivorceCommand(QQWifeBaseCommand):
         uid = self.get_user_id()
         uname = self.get_user_name()
         user_lock_key = f"{gid}:{uid}"
+        result_code = "ok"
+        text_msg = ""
 
         async with self.guard_user_operation(user_lock_key) as user_locked:
             if not user_locked:
@@ -835,45 +916,51 @@ class QQWifeDivorceCommand(QQWifeBaseCommand):
                 async with QQWIFE_DB.transaction():
                     await QQWIFE_DB.upsert_active_user(gid, uid, uname)
                     settings = await self.ensure_daily(gid)
-                    if not await self.check_cd_or_reply(gid, uid, MODE_DIVORCE, settings):
-                        return True, "cd", 1
-
-                    user_info = await QQWIFE_DB.get_member_marriage(gid, uid)
-                    if user_info is None:
-                        await self.send_text("今天你还没结婚。")
-                        return True, "not_married", 1
-
-                    spouse_id = ""
-                    user_pos = -1
-                    if user_info.user_id == uid:
-                        spouse_id = user_info.target_id
-                        user_pos = 1
-                    elif user_info.target_id == uid:
-                        spouse_id = user_info.user_id
-                        user_pos = 0
+                    cd_ok, cd_msg = await self.check_cd_or_reply(gid, uid, MODE_DIVORCE, settings)
+                    if not cd_ok:
+                        text_msg = cd_msg or "你的技能还在CD中。"
+                        result_code = "cd"
                     else:
-                        await self.send_text("婚姻数据异常。")
-                        return True, "invalid_data", 1
+                        user_info = await QQWIFE_DB.get_member_marriage(gid, uid)
+                        if user_info is None:
+                            text_msg = "今天你还没结婚。"
+                            result_code = "not_married"
+                        else:
+                            spouse_id = ""
+                            user_pos = -1
+                            if user_info.user_id == uid:
+                                spouse_id = user_info.target_id
+                                user_pos = 1
+                            elif user_info.target_id == uid:
+                                spouse_id = user_info.user_id
+                                user_pos = 0
+                            else:
+                                text_msg = "婚姻数据异常。"
+                                result_code = "invalid_data"
 
-                    favor = await QQWIFE_DB.get_favor(uid, spouse_id)
-                    if favor < 20:
-                        favor = 10
-                    if random.randint(0, 100) > (110 - favor):
-                        await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
-                        await self.send_text(random.choice(DIVORCE_FAIL_TEXTS))
-                        return True, "failed", 1
+                            if user_pos in (0, 1):
+                                favor = await QQWIFE_DB.get_favor(uid, spouse_id)
+                                if favor < 20:
+                                    favor = 10
+                                if random.randint(0, 100) > (110 - favor):
+                                    await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
+                                    text_msg = random.choice(DIVORCE_FAIL_TEXTS)
+                                    result_code = "failed"
+                                else:
+                                    if user_pos == 1:
+                                        ok = await QQWIFE_DB.delete_marriage_by_user(gid, uid)
+                                    else:
+                                        ok = await QQWIFE_DB.delete_marriage_by_target(gid, uid)
+                                    if not ok:
+                                        text_msg = "离婚失败，记录可能已被修改。"
+                                        result_code = "not_found"
+                                    else:
+                                        await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
+                                        text_msg = random.choice(DIVORCE_SUCCESS_TEXTS)
+                                        result_code = "ok"
 
-                    if user_pos == 1:
-                        ok = await QQWIFE_DB.delete_marriage_by_user(gid, uid)
-                    else:
-                        ok = await QQWIFE_DB.delete_marriage_by_target(gid, uid)
-                    if not ok:
-                        await self.send_text("离婚失败，记录可能已被修改。")
-                        return True, "not_found", 1
-
-                    await QQWIFE_DB.record_cd(gid, uid, MODE_DIVORCE)
-                    await self.send_text(random.choice(DIVORCE_SUCCESS_TEXTS))
-                    return True, "ok", 1
+        await self.send_text(text_msg)
+        return True, result_code, 1
 
 
 class QQWifeGiftCommand(QQWifeBaseCommand):
@@ -897,6 +984,8 @@ class QQWifeGiftCommand(QQWifeBaseCommand):
             return True, "self_target", 1
 
         user_lock_key = f"{gid}:{uid}"
+        result_code = "ok"
+        text_msg = ""
         async with self.guard_user_operation(user_lock_key) as user_locked:
             if not user_locked:
                 return True, "user_busy", 1
@@ -905,45 +994,50 @@ class QQWifeGiftCommand(QQWifeBaseCommand):
                 await QQWIFE_DB.upsert_active_user(gid, uid, uname)
                 settings = await self.ensure_daily(gid)
 
-                if not await self.check_cd_or_reply(gid, uid, MODE_GIFT, settings):
-                    return True, "cd", 1
-
-                favor = await QQWIFE_DB.get_favor(uid, target_id)
-                balance = await QQWIFE_DB.get_balance(uid)
-                if balance < 1:
-                    await self.send_text("你钱包没钱啦。")
-                    return True, "balance_empty", 1
-
-                cost = random.randint(1, min(balance, self.get_gift_max_cost()))
-                favor_delta = 1
-                mood_max = 2
-                if favor > 50:
-                    favor_delta = cost % 10
+                cd_ok, cd_msg = await self.check_cd_or_reply(gid, uid, MODE_GIFT, settings)
+                if not cd_ok:
+                    text_msg = cd_msg or "你的技能还在CD中。"
+                    result_code = "cd"
                 else:
-                    mood_max = 5
-                    favor_delta += random.randint(0, max(0, cost - 1))
-                mood = random.randint(0, mood_max - 1)
-                if mood == 0:
-                    favor_delta = -favor_delta
+                    favor = await QQWIFE_DB.get_favor(uid, target_id)
+                    balance = await QQWIFE_DB.get_balance(uid)
+                    if balance < 1:
+                        text_msg = "你钱包没钱啦。"
+                        result_code = "balance_empty"
+                    else:
+                        cost = random.randint(1, min(balance, self.get_gift_max_cost()))
+                        favor_delta = 1
+                        mood_max = 2
+                        if favor > 50:
+                            favor_delta = cost % 10
+                        else:
+                            mood_max = 5
+                            favor_delta += random.randint(0, max(0, cost - 1))
+                        mood = random.randint(0, mood_max - 1)
+                        if mood == 0:
+                            favor_delta = -favor_delta
 
-                ok, _ = await QQWIFE_DB.change_balance(uid, -cost)
-                if not ok:
-                    await self.send_text("扣款失败，你的钱包可能被并发修改，请重试。")
-                    return True, "charge_failed", 1
+                        ok, _ = await QQWIFE_DB.change_balance(uid, -cost)
+                        if not ok:
+                            text_msg = "扣款失败，你的钱包可能被并发修改，请重试。"
+                            result_code = "charge_failed"
+                        else:
+                            last_favor = await QQWIFE_DB.update_favor(uid, target_id, favor_delta)
+                            await QQWIFE_DB.record_cd(gid, uid, MODE_GIFT)
 
-                last_favor = await QQWIFE_DB.update_favor(uid, target_id, favor_delta)
-                await QQWIFE_DB.record_cd(gid, uid, MODE_GIFT)
+                            wallet_name = self.get_wallet_name()
+                            if mood == 0:
+                                text_msg = (
+                                    f"你花了 {cost} {wallet_name} 买了礼物送给 ta，ta不太喜欢。你们的好感度降低至 {last_favor}"
+                                )
+                            else:
+                                text_msg = (
+                                    f"你花了 {cost} {wallet_name} 买了礼物送给 ta，ta很喜欢。你们的好感度升至 {last_favor}"
+                                )
+                            result_code = "ok"
 
-                wallet_name = self.get_wallet_name()
-                if mood == 0:
-                    await self.send_text(
-                        f"你花了 {cost} {wallet_name} 买了礼物送给 ta，ta不太喜欢。你们的好感度降低至 {last_favor}"
-                    )
-                else:
-                    await self.send_text(
-                        f"你花了 {cost} {wallet_name} 买了礼物送给 ta，ta很喜欢。你们的好感度升至 {last_favor}"
-                    )
-                return True, "ok", 1
+        await self.send_text(text_msg)
+        return True, result_code, 1
 
 
 class QQWifeSetCDCommand(QQWifeBaseCommand):
@@ -1060,12 +1154,21 @@ class QQWifeFavorListCommand(QQWifeBaseCommand):
             await self.send_text("你还没有任何好感度记录。")
             return True, "empty", 1
 
-        lines = ["你的好感度排行列表", "--------------------"]
-        for idx, (target_id, favor) in enumerate(pairs, start=1):
-            name = await self.display_name(gid, target_id, target_id)
-            bar = "#" * max(1, favor // 10) if favor > 0 else "-"
-            lines.append(f"{idx}. {name}({target_id}) {favor:>3} [{bar}]")
-        await self.send_text("\n".join(lines))
+        try:
+            parsed_pairs = []
+            for target_id, favor in pairs:
+                name = await self.display_name(gid, target_id, target_id)
+                parsed_pairs.append((target_id, favor, name))
+            b64_img = await generate_favor_image(parsed_pairs)
+            await self.send_image(b64_img)
+        except Exception as e:
+            logger.error(f"Generate favor image error: {e}")
+            lines = ["你的好感度排行列表", "--------------------"]
+            for idx, (target_id, favor) in enumerate(pairs, start=1):
+                name = await self.display_name(gid, target_id, target_id)
+                bar = "#" * max(1, favor // 10) if favor > 0 else "-"
+                lines.append(f"{idx}. {name}({target_id}) {favor:>3} [{bar}]")
+            await self.send_text("\n".join(lines))
         return True, "ok", 1
 
 
@@ -1140,6 +1243,7 @@ class QQWifePlugin(BasePlugin):
             "wallet_name": ConfigField(type=str, default="麦币", description="钱包货币名称"),
             "default_cd_hours": ConfigField(type=float, default=12.0, description="默认技能CD（小时）"),
             "recent_candidate_limit": ConfigField(type=int, default=30, description="随机娶群友候选人数上限"),
+            "roster_max_entries": ConfigField(type=int, default=15, description="群老婆列表渲染最大条数 (建议20以内)"),
             "gift_max_cost": ConfigField(type=int, default=100, description="单次送礼最大花费"),
             "allow_message_fallback_candidates": ConfigField(
                 type=bool,

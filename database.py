@@ -526,9 +526,16 @@ class QQWifeDB:
                 row = await cursor.fetchone()
         return bool(row and int(row["cnt"]) > 0)
 
-    async def list_group_marriages(self, group_id: str, include_single: bool = False) -> List[MarriageRecord]:
+    async def list_group_marriages(
+        self,
+        group_id: str,
+        include_single: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[MarriageRecord]:
         await self._ensure_conn()
         assert self.conn is not None
+        query_limit = int(limit) if limit is not None else 0
+        use_limit = query_limit > 0
         if include_single:
             query = """
                 SELECT group_id, user_id, target_id, username, target_name, married_date, married_at
@@ -545,6 +552,9 @@ class QQWifeDB:
                 ORDER BY married_at ASC
             """
             params = (group_id,)
+        if use_limit:
+            query = f"{query}\n LIMIT ?"
+            params = (*params, query_limit)
         records: List[MarriageRecord] = []
         async with self.conn.execute(query, params) as cursor:
             rows = await cursor.fetchall()
